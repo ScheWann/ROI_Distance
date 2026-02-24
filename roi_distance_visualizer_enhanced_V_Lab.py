@@ -4844,43 +4844,115 @@ class EnhancedROIVisualizerV3(QMainWindow):
                                "ROI name standardization would use metadata from .mat files\n"
                                "This feature can be extended based on your specific requirements")
     
+    def _do_merge_rtstruct_dicom(self, normal_paths, abas_paths, output_path):
+        """Chain-merge DICOM RTSTRUCT files: base=Normal[0], then Normal[1..n], then ABAS[0..m].
+        Skips ROI names already present (first-occurrence wins, Normal priority).
+        Returns dict with output_path, normal_rois, abas_rois."""
+        from copy import deepcopy
+
+        if not normal_paths:
+            raise ValueError("At least one Normal RTSTRUCT is required")
+        if not abas_paths:
+            raise ValueError("At least one ABAS RTSTRUCT is required")
+
+        # Step 1: base = Normal[0]
+        ds_base = pydicom.dcmread(normal_paths[0])
+        if not hasattr(ds_base, 'StructureSetROISequence'):
+            raise ValueError("Base RTSTRUCT has no StructureSetROISequence")
+
+        existing_names = set()
+        for roi in ds_base.StructureSetROISequence:
+            existing_names.add(str(roi.ROIName).strip().lower())
+
+        max_roi_num = 0
+        for roi in ds_base.StructureSetROISequence:
+            n = int(roi.ROINumber)
+            if n > max_roi_num:
+                max_roi_num = n
+
+        if not hasattr(ds_base, 'ROIContourSequence') or ds_base.ROIContourSequence is None:
+            ds_base.ROIContourSequence = pydicom.sequence.Sequence()
+
+        normal_count = len(ds_base.StructureSetROISequence)
+        abas_count = 0
+
+        def _add_from_file(ds_src, is_abas):
+            """Add ROIs from ds_src to ds_base, skipping duplicate names."""
+            nonlocal max_roi_num, normal_count, abas_count
+            roi_contour_src = ds_src.ROIContourSequence if hasattr(ds_src, 'ROIContourSequence') else []
+            added = 0
+            for roi in ds_src.StructureSetROISequence:
+                roi_name_key = str(roi.ROIName).strip().lower()
+                if roi_name_key in existing_names:
+                    continue
+                existing_names.add(roi_name_key)
+                orig_number = roi.ROINumber
+                max_roi_num += 1
+                new_number = max_roi_num
+                new_roi = deepcopy(roi)
+                new_roi.ROINumber = new_number
+                ds_base.StructureSetROISequence.append(new_roi)
+                for roi_contour in roi_contour_src:
+                    if (hasattr(roi_contour, 'ReferencedROINumber') and
+                            int(roi_contour.ReferencedROINumber) == int(orig_number)):
+                        new_contour = deepcopy(roi_contour)
+                        new_contour.ReferencedROINumber = new_number
+                        ds_base.ROIContourSequence.append(new_contour)
+                        break
+                added += 1
+                if is_abas:
+                    abas_count += 1
+                else:
+                    normal_count += 1
+            return added
+
+        # Step 2: Merge Normal[1], Normal[2], ... (skip duplicates, first wins)
+        for path in normal_paths[1:]:
+            ds_src = pydicom.dcmread(path)
+            if hasattr(ds_src, 'StructureSetROISequence'):
+                _add_from_file(ds_src, is_abas=False)
+
+        # Step 3: Merge ABAS[0], ABAS[1], ... (skip duplicates, Normal priority)
+        for path in abas_paths:
+            ds_src = pydicom.dcmread(path)
+            if hasattr(ds_src, 'StructureSetROISequence'):
+                _add_from_file(ds_src, is_abas=True)
+
+        # Step 4: Output MergedSS.dcm
+        ds_base.save_as(output_path)
+        return {'output_path': output_path, 'normal_rois': normal_count, 'abas_rois': abas_count}
+
     def merge_rtstructs(self):
-        """Merge RTSTRUCT and ABAS RTSTRUCT"""
+        """Merge RTSTRUCT and ABAS RTSTRUCT (chain merge: Normal[0..n] then ABAS[0..m], skip duplicates)"""
         if not (self.scan_results.get('rtstruct_files') and 
                 self.scan_results.get('abas_rtstruct_files')):
             QMessageBox.warning(self, "Missing Files", 
                               "Need both RTSTRUCT and ABAS RTSTRUCT files to merge")
             return
-        
-        rtstruct_path = self.scan_results['rtstruct_files'][0]
-        abas_path = self.scan_results['abas_rtstruct_files'][0]
-        output_folder = os.path.dirname(rtstruct_path)
+
+        abas_set = set(self.scan_results.get('abas_rtstruct_files', []))
+        normal_paths = [f for f in self.scan_results.get('rtstruct_files', []) if f not in abas_set]
+        abas_paths = list(abas_set)
+
+        if not normal_paths or not abas_paths:
+            QMessageBox.warning(self, "Missing Files",
+                              "Need both Normal and ABAS RTSTRUCT files to merge")
+            return
+
+        output_folder = os.path.dirname(normal_paths[0])
         output_path = os.path.join(output_folder, 'MergedSS.dcm')
-        
+
         try:
-            metadata_normal = None
-            metadata_abas = None
-            try:
-                import scipy.io
-                if os.path.exists('direct_metas.mat'):
-                    metadata_normal = scipy.io.loadmat('direct_metas.mat')
-                if os.path.exists('direct_metas_ABAS.mat'):
-                    metadata_abas = scipy.io.loadmat('direct_metas_ABAS.mat')
-            except:
-                pass
-            
-            from merge_rtstruct import merge_rtstructs
-            
             # Add merge start message to progress log
             timestamp = pd.Timestamp.now().strftime('%H:%M:%S')
-            self.progress_text.append(f"[{timestamp}] Starting RTSTRUCT merge...")
+            self.progress_text.append(f"[{timestamp}] Starting RTSTRUCT merge "
+                                      f"({len(normal_paths)} Normal + {len(abas_paths)} ABAS)...")
             self.progress_text.verticalScrollBar().setValue(
                 self.progress_text.verticalScrollBar().maximum()
             )
-            
-            # Capture merge output and add to progress log
-            merge_result = merge_rtstructs(rtstruct_path, abas_path, output_path, 
-                          metadata_normal, metadata_abas)
+
+            # Chain merge: base=Normal[0], then Normal[1..n], then ABAS[0..m] (skip duplicate ROI names)
+            merge_result = self._do_merge_rtstruct_dicom(normal_paths, abas_paths, output_path)
             
             # Extract output path and counts from result
             if isinstance(merge_result, dict):
