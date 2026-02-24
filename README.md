@@ -131,6 +131,35 @@ python roi_distance_visualizer_enhanced_V_Lab.py
    - Select a target ROI to view distance measurements
    - Use "Show Head/Neck Mask" to overlay anatomical reference (optional)
 
+### Batch Processing (CLI, No GUI)
+
+For processing multiple patients on a remote server or in the background, use the command-line batch script. It does **not** require PyQt5 or a display.
+
+```bash
+Usage:
+
+python batch_process.py /path/to/parent_folder [options]
+
+Options:
+
+--no-merge: Do not merge; only use the first available RTSTRUCT.
+
+--skip-existing: Skip if a CSV already exists.
+
+--cores: N (Number of CPU cores; default 4).
+
+--verbose, -v: Verbose output.
+
+
+# Run in background (e.g. on remote server)
+nohup python batch_process.py /path/to/parent_folder --skip-existing --cores 10 > batch.log 2>&1 &
+```
+
+The batch script will, for each patient subfolder:
+1. Scan for CT and RTSTRUCT files
+2. Merge Normal + ABAS RTSTRUCT if both exist (chain merge, skip duplicate ROI names)
+3. Generate `CT_centroid.csv` and `CT_distances.csv` in the patient folder
+
 ### Workflow Overview
 
 The tool is organized into three main tabs:
