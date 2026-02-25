@@ -16,7 +16,7 @@ import pandas as pd
 import pydicom
 from scipy.ndimage import binary_fill_holes
 from skimage.measure import regionprops, label
-from skimage.morphology import binary_closing
+from skimage.morphology import closing
 
 warnings.filterwarnings('ignore', message='.*Camel case attribute.*', category=UserWarning)
 
@@ -286,7 +286,7 @@ def _rtstruct_to_mask(struct_file, spatial_data):
         for z in range(image_z):
             if np.any(binary_map[:, :, z]):
                 binary_map[:, :, z] = binary_fill_holes(binary_map[:, :, z])
-                binary_map[:, :, z] = binary_closing(binary_map[:, :, z])
+                binary_map[:, :, z] = closing(binary_map[:, :, z])
 
         structure_array.append({'voxels': int(np.sum(binary_map)), 'label': roi_label, 'dat': binary_map})
     return structure_array
