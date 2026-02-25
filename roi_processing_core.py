@@ -8,7 +8,7 @@ import re
 import warnings
 from pathlib import Path
 from copy import deepcopy
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 
 import numpy as np
@@ -19,6 +19,22 @@ from skimage.measure import regionprops, label
 from skimage.morphology import closing
 
 warnings.filterwarnings('ignore', message='.*Camel case attribute.*', category=UserWarning)
+
+IGNORE_ROI_NAMES = {
+    "external",
+    "fsbody",
+    "vms igrtct 6mv d1.05",
+    "brainlab couch 6mv d1.05",
+    "fs nt",
+    "fsnormaltissue",
+    "fs_contracted",
+    "ext-0.3",
+    "couch",
+    "marked iso_1",
+    "final iso_1",
+    "marked iso",
+    "final iso",
+}
 
 # GPU support (optional)
 GPU_AVAILABLE = False
@@ -113,55 +129,94 @@ def _extract_mrn(folder):
 
 
 def merge_rtstruct_dicom(normal_paths, abas_paths, output_path):
-    """Chain-merge RTSTRUCT files. Returns dict with output_path, normal_rois, abas_rois."""
-    if not normal_paths or not abas_paths:
-        raise ValueError("Need both Normal and ABAS RTSTRUCT files")
+    """Chain-merge RTSTRUCT files.
 
-    ds_base = pydicom.dcmread(normal_paths[0])
+    ABAS has priority: use first ABAS RTSTRUCT as base if available,
+    then merge remaining ABAS files, then merge Normal files.
+    Returns dict with output_path, normal_rois, abas_rois.
+    """
+    if not normal_paths and not abas_paths:
+        raise ValueError("Need at least one Normal or ABAS RTSTRUCT file")
+
+    # Choose base: prefer ABAS if present
+    if abas_paths:
+        base_path = abas_paths[0]
+        base_is_abas = True
+        remaining_abas = abas_paths[1:]
+        remaining_normals = normal_paths
+    else:
+        base_path = normal_paths[0]
+        base_is_abas = False
+        remaining_abas = []
+        remaining_normals = normal_paths[1:]
+
+    ds_base = pydicom.dcmread(base_path)
     if not hasattr(ds_base, 'StructureSetROISequence'):
         raise ValueError("Base RTSTRUCT has no StructureSetROISequence")
 
-    existing_names = {str(roi.ROIName).strip().lower() for roi in ds_base.StructureSetROISequence}
+    existing_names = {str(roi.ROIName).strip().lower()
+                      for roi in ds_base.StructureSetROISequence}
+
     max_roi_num = max(int(roi.ROINumber) for roi in ds_base.StructureSetROISequence)
     if not hasattr(ds_base, 'ROIContourSequence') or ds_base.ROIContourSequence is None:
         ds_base.ROIContourSequence = pydicom.sequence.Sequence()
 
-    normal_count = len(ds_base.StructureSetROISequence)
-    abas_count = 0
+    # Count how many ROIs come from Normal vs ABAS
+    if base_is_abas:
+        abas_count = len(ds_base.StructureSetROISequence)
+        normal_count = 0
+    else:
+        normal_count = len(ds_base.StructureSetROISequence)
+        abas_count = 0
 
-    def add_from_file(ds_src, is_abas):
+    def add_from_file(ds_src, is_abas: bool):
         nonlocal max_roi_num, normal_count, abas_count
         roi_contour_src = getattr(ds_src, 'ROIContourSequence', None) or []
+
         for roi in ds_src.StructureSetROISequence:
             key = str(roi.ROIName).strip().lower()
+
+            # Skip ignored ROI names entirely
+            if key in IGNORE_ROI_NAMES:
+                continue
+
+            # Skip duplicate names
             if key in existing_names:
                 continue
+
             existing_names.add(key)
+
             max_roi_num += 1
             new_number = max_roi_num
             orig_number = roi.ROINumber
+
             new_roi = deepcopy(roi)
             new_roi.ROINumber = new_number
             ds_base.StructureSetROISequence.append(new_roi)
+
             for rc in roi_contour_src:
                 if hasattr(rc, 'ReferencedROINumber') and int(rc.ReferencedROINumber) == int(orig_number):
                     new_contour = deepcopy(rc)
                     new_contour.ReferencedROINumber = new_number
                     ds_base.ROIContourSequence.append(new_contour)
                     break
+
             if is_abas:
                 abas_count += 1
             else:
                 normal_count += 1
 
-    for path in normal_paths[1:]:
-        ds_src = pydicom.dcmread(path)
-        if hasattr(ds_src, 'StructureSetROISequence'):
-            add_from_file(ds_src, False)
-    for path in abas_paths:
+    # 1) merge remaining ABAS files
+    for path in remaining_abas:
         ds_src = pydicom.dcmread(path)
         if hasattr(ds_src, 'StructureSetROISequence'):
             add_from_file(ds_src, True)
+
+    # 2) then merge Normal files
+    for path in remaining_normals:
+        ds_src = pydicom.dcmread(path)
+        if hasattr(ds_src, 'StructureSetROISequence'):
+            add_from_file(ds_src, False)
 
     ds_base.save_as(output_path)
     return {'output_path': output_path, 'normal_rois': normal_count, 'abas_rois': abas_count}
@@ -253,6 +308,12 @@ def _rtstruct_to_mask(struct_file, spatial_data):
     for roi in roi_list:
         roi_number = roi.ROINumber
         roi_label = roi.ROIName
+
+        # Skip ignored ROI names
+        name_norm = str(roi_label).strip().lower()
+        if name_norm in IGNORE_ROI_NAMES:
+            continue
+
         contour_data = next((rc for rc in roi_contour_seq
                             if hasattr(rc, 'ReferencedROINumber') and
                             int(rc.ReferencedROINumber) == int(roi_number)), None)
@@ -309,92 +370,129 @@ def _generate_centroid_csv(contours, contour_list, output_path):
                     f.write(f"{contour_list[i]},{round(np.mean(coords[1]), 2)},{round(np.mean(coords[0]), 2)},{round(np.mean(coords[2]), 2)}\n")
 
 
-def _distance_worker(reference, target, xdim, ydim, zdim, ref_name, target_name):
-    """Worker for parallel distance calculation"""
+def _distance_reference_worker(args):
+    """Worker for one reference ROI: compute EDT once, then all pairs (i, j) for j > i.
+    Module-level so it can be used with ThreadPoolExecutor (shared memory, no large serialization).
+    args: (i, contours, contour_list, dx, dy, dz)
+    Returns: list of result dicts for this reference."""
     from scipy.ndimage import distance_transform_edt
 
-    ref_coords = np.where(reference)
-    target_coords = np.where(target)
-    if len(ref_coords[0]) == 0 or len(target_coords[0]) == 0:
-        return {'Reference ROI': ref_name, 'Target ROI': target_name, 'Eucledian Distance (mm)': 0.0,
-                'Phi (degrees)': 0.0, 'Theta (degrees)': 0.0, '% of Target Overlap': 0.0,
-                'Eucledian Distance (mm) 5th Percentile': 0.0}
+    i, contours, contour_list, dx, dy, dz = args
+    n = len(contour_list)
+    ref_mask = contours[i]['dat'].astype(bool)
+    ref_name = contour_list[i]
+    ref_coords = np.where(ref_mask)
+    out = []
 
-    all_y = np.concatenate([ref_coords[0], target_coords[0]])
-    all_x = np.concatenate([ref_coords[1], target_coords[1]])
-    all_z = np.concatenate([ref_coords[2], target_coords[2]])
-    y_min = max(0, all_y.min() - 10)
-    y_max = min(reference.shape[0], all_y.max() + 10)
-    x_min = max(0, all_x.min() - 10)
-    x_max = min(reference.shape[1], all_x.max() + 10)
-    z_min = max(0, all_z.min() - 2)
-    z_max = min(reference.shape[2], all_z.max() + 2)
+    if len(ref_coords[0]) == 0:
+        for j in range(i + 1, n):
+            out.append({
+                'Reference ROI': ref_name,
+                'Target ROI': contour_list[j],
+                'Eucledian Distance (mm)': 0.0,
+                'Phi (degrees)': 0.0,
+                'Theta (degrees)': 0.0,
+                '% of Target Overlap': 0.0,
+                'Eucledian Distance (mm) 5th Percentile': 0.0,
+            })
+        return out
 
-    ref_crop = reference[y_min:y_max, x_min:x_max, z_min:z_max]
-    target_crop = target[y_min:y_max, x_min:x_max, z_min:z_max]
-    aspect = [ydim, xdim, zdim]
-    dist_ref = distance_transform_edt(~ref_crop, sampling=aspect).astype(np.float32)
-    dist_not_ref = distance_transform_edt(ref_crop, sampling=aspect).astype(np.float32)
-    target_voxels = target_crop == 1
-    distances = np.where(target_voxels,
-                        np.where(ref_crop == 1, dist_not_ref, dist_ref), 0.0)[target_voxels]
-    distances = distances[distances > 0]
+    aspect = [dy, dx, dz]
+    dist_ref = distance_transform_edt(~ref_mask, sampling=aspect).astype(np.float32)
+    dist_not_ref = distance_transform_edt(ref_mask, sampling=aspect).astype(np.float32)
+    ref_c = np.array([
+        np.mean(ref_coords[1]),
+        np.mean(ref_coords[0]),
+        np.mean(ref_coords[2]),
+    ])
 
-    if len(distances) == 0:
-        min_dist = 0.0
-        r5 = 0.0
-    else:
-        min_dist = float(np.min(distances))
-        r5 = float(np.percentile(distances, 5)) if len(distances) > 1 else min_dist
+    for j in range(i + 1, n):
+        target_mask = contours[j]['dat'].astype(bool)
+        target_name = contour_list[j]
+        target_coords = np.where(target_mask)
+        if len(target_coords[0]) == 0:
+            out.append({
+                'Reference ROI': ref_name,
+                'Target ROI': target_name,
+                'Eucledian Distance (mm)': 0.0,
+                'Phi (degrees)': 0.0,
+                'Theta (degrees)': 0.0,
+                '% of Target Overlap': 0.0,
+                'Eucledian Distance (mm) 5th Percentile': 0.0,
+            })
+            continue
 
-    if len(ref_coords[0]) > 0 and len(target_coords[0]) > 0:
-        ref_c = np.array([np.mean(ref_coords[1]), np.mean(ref_coords[0]), np.mean(ref_coords[2])])
-        tgt_c = np.array([np.mean(target_coords[1]), np.mean(target_coords[0]), np.mean(target_coords[2])])
-        vec = (tgt_c - ref_c) * np.array([xdim, ydim, zdim])
+        target_voxels = target_mask
+        distances_all = np.where(
+            target_voxels,
+            np.where(ref_mask, dist_not_ref, dist_ref),
+            0.0,
+        )[target_voxels]
+        distances = distances_all[distances_all > 0]
+
+        if len(distances) == 0:
+            min_dist = 0.0
+            r5 = 0.0
+        else:
+            min_dist = float(np.min(distances))
+            r5 = float(np.percentile(distances, 5)) if len(distances) > 1 else min_dist
+
+        tgt_c = np.array([
+            np.mean(target_coords[1]),
+            np.mean(target_coords[0]),
+            np.mean(target_coords[2]),
+        ])
+        vec = (tgt_c - ref_c) * np.array([dx, dy, dz])
         r = np.linalg.norm(vec)
-        theta = np.arctan2(vec[0], -vec[1]) * 180 / np.pi if r > 0 else 0.0
-        phi = np.arcsin(vec[2] / r) * 180 / np.pi if r > 0 else 0.0
-    else:
-        theta = phi = 0.0
+        if r > 0:
+            theta = np.arctan2(vec[0], -vec[1]) * 180 / np.pi
+            phi = np.arcsin(vec[2] / r) * 180 / np.pi
+        else:
+            theta = 0.0
+            phi = 0.0
+        overlap = np.sum(ref_mask & target_mask) / max(1, np.sum(target_mask))
 
-    overlap = np.sum((reference == 1) & (target == 1)) / max(1, np.sum(target == 1))
-
-    return {
-        'Reference ROI': ref_name, 'Target ROI': target_name,
-        'Eucledian Distance (mm)': round(min_dist, 2), 'Phi (degrees)': round(phi, 2),
-        'Theta (degrees)': round(theta, 2), '% of Target Overlap': round(overlap, 2),
-        'Eucledian Distance (mm) 5th Percentile': round(r5, 2)
-    }
+        out.append({
+            'Reference ROI': ref_name,
+            'Target ROI': target_name,
+            'Eucledian Distance (mm)': round(min_dist, 2),
+            'Phi (degrees)': round(float(phi), 2),
+            'Theta (degrees)': round(float(theta), 2),
+            '% of Target Overlap': round(float(overlap), 2),
+            'Eucledian Distance (mm) 5th Percentile': round(r5, 2),
+        })
+    return out
 
 
 def _generate_distance_csv_parallel(contours, contour_list, dx, dy, dz, output_path, num_cores, log_fn):
-    """Generate distance CSV using parallel CPU"""
-    from scipy.ndimage import distance_transform_edt
-
+    """Generate distance CSV by reusing distance transforms per reference ROI, in parallel over references."""
     n = len(contour_list)
-    combo = [(i, j) for i in range(n) for j in range(i + 1, n)]
-    num_workers = max(1, min(num_cores, len(combo), mp.cpu_count()))
-    batch_size = max(3, num_workers // 2)
-    results = []
-    executor = ProcessPoolExecutor(max_workers=num_workers)
+    total_pairs = n * (n - 1) // 2 if n > 1 else 0
+    num_workers = max(1, min(num_cores, n, mp.cpu_count()))
 
-    try:
-        for batch_start in range(0, len(combo), batch_size):
-            batch = combo[batch_start:batch_start + batch_size]
-            futures = {}
-            for i, j in batch:
-                futures[executor.submit(
-                    _distance_worker,
-                    contours[i]['dat'], contours[j]['dat'], dx, dy, dz,
-                    contour_list[i], contour_list[j]
-                )] = (i, j)
-            for future in as_completed(futures):
-                results.append(future.result())
-            done = batch_start + len(batch)
-            if log_fn and done % 20 == 0:
-                log_fn(70 + int(30 * done / len(combo)), f"Processed {done}/{len(combo)} pairs...")
-    finally:
-        executor.shutdown(wait=True)
+    if n <= 0:
+        pd.DataFrame(columns=[
+            'Reference ROI', 'Target ROI', 'Eucledian Distance (mm)',
+            'Phi (degrees)', 'Theta (degrees)', '% of Target Overlap',
+            'Eucledian Distance (mm) 5th Percentile'
+        ]).to_csv(output_path, index=False)
+        return
+
+    task_args = [(i, contours, contour_list, dx, dy, dz) for i in range(n)]
+    results = []
+
+    # ThreadPoolExecutor avoids Windows multiprocessing pipe size limits when passing large contours.
+    # SciPy/Numpy release the GIL during EDT, so threads still get real CPU parallelism.
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = list(executor.submit(_distance_reference_worker, a) for a in task_args)
+        done = 0
+        for future in futures:
+            results.extend(future.result())
+            done += 1
+            if log_fn and total_pairs > 0 and done % max(1, n // 10 or 1) == 0:
+                pct = 70 + int(30 * done / n)
+                pairs_approx = done * n - (done * (done + 1) // 2) if done <= n else total_pairs
+                log_fn(pct, f"Processed {pairs_approx}/{total_pairs} pairs...")
 
     df = pd.DataFrame(results)
     df.to_csv(output_path, index=False, float_format='%.2f')

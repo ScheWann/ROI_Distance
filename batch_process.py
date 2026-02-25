@@ -58,7 +58,8 @@ def process_one_patient(patient_path, merge_if_possible=True, num_cores=4, skip_
     def log(msg):
         if progress_callback:
             progress_callback(msg)
-        print(f"  {msg}")
+        else:
+            print(f"  {msg}")
 
     results = {'path': patient_path, 'success': False, 'error': None, 'merged': False, 'csv_generated': False}
 
