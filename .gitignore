@@ -4,3 +4,9 @@
 __pycache__
 Folder_*.zip
 Folder_*/
+
+
+venv/
+Folder_*/
+Folder_*.zip
+*.log
