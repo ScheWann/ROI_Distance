@@ -104,17 +104,44 @@ def process_one_patient(patient_path, merge_if_possible=True, num_cores=4, skip_
             results['error'] = "No RTSTRUCT file found (need Normal, ABAS, or Merged)"
             return results
 
-        output_folder = Path(rtstruct_to_use).parent
-        centroid_path = output_folder / 'CT_centroid.csv'
-        distance_path = output_folder / 'CT_distances.csv'
+        # output_folder = Path(rtstruct_to_use).parent
+        # centroid_path = output_folder / 'CT_centroid.csv'
+        # distance_path = output_folder / 'CT_distances.csv'
 
-        if skip_existing and centroid_path.exists() and distance_path.exists():
+        # if skip_existing and centroid_path.exists() and distance_path.exists():
+        #     log("CSV files already exist, skipping generation")
+        #     results['success'] = True
+        #     results['csv_generated'] = True
+        #     return results
+
+        # Generate CSV
+        log("Generating CSV files...")
+
+        def csv_progress(pct, msg):
+            if progress_callback:
+                progress_callback(f"  [{pct}%] {msg}")
+                
+                
+        output_folder = Path(rtstruct_to_use).parent
+
+        centroid_final = output_folder / 'CT_centroid.csv'
+        distance_final = output_folder / 'CT_distances.csv'
+        centroid_tmp = output_folder / 'CT_centroid.csv.tmp'
+        distance_tmp = output_folder / 'CT_distances.csv.tmp'
+
+        # If previous run died, remove old tmp
+        for p in (centroid_tmp, distance_tmp):
+            if p.exists():
+                p.unlink()
+
+        # Skip only if FINAL files exist
+        if skip_existing and centroid_final.exists() and distance_final.exists():
             log("CSV files already exist, skipping generation")
             results['success'] = True
             results['csv_generated'] = True
             return results
 
-        # Generate CSV
+        # Generate CSV (WRITE TO TMP)
         log("Generating CSV files...")
 
         def csv_progress(pct, msg):
@@ -127,7 +154,14 @@ def process_one_patient(patient_path, merge_if_possible=True, num_cores=4, skip_
             str(output_folder),
             num_cores=num_cores,
             progress_callback=csv_progress,
+            centroid_filename="CT_centroid.csv.tmp",
+            distance_filename="CT_distances.csv.tmp",
         )
+
+        # Publish TMP -> FINAL (atomic)
+        centroid_tmp.replace(centroid_final)
+        distance_tmp.replace(distance_final)
+
         results['success'] = True
         results['csv_generated'] = True
         log("Done: CT_centroid.csv, CT_distances.csv")

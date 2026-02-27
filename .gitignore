@@ -10,3 +10,4 @@ venv/
 Folder_*/
 Folder_*.zip
 *.log
+batch.pid

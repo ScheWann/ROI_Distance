@@ -222,8 +222,18 @@ def merge_rtstruct_dicom(normal_paths, abas_paths, output_path):
     return {'output_path': output_path, 'normal_rois': normal_count, 'abas_rois': abas_count}
 
 
-def generate_csv_sync(ct_folder, rtstruct_path, output_folder, num_cores=4, progress_callback=None):
-    """Generate CT_centroid.csv and CT_distances.csv. progress_callback(percent, message) optional."""
+def generate_csv_sync(
+    ct_folder,
+    rtstruct_path,
+    output_folder,
+    num_cores=4,
+    progress_callback=None,
+    centroid_filename="CT_centroid.csv",
+    distance_filename="CT_distances.csv",
+):
+    """Generate centroid + distance CSVs. Writes to filenames provided (defaults to CT_centroid.csv / CT_distances.csv).
+    progress_callback(percent, message) optional.
+    """
     def log(pct, msg):
         if progress_callback:
             progress_callback(pct, msg)
@@ -245,11 +255,11 @@ def generate_csv_sync(ct_folder, rtstruct_path, output_folder, num_cores=4, prog
         dz = float(spatial_data[0].get('sliceThickness', 1.0))
 
     log(50, "Calculating ROI centroids...")
-    centroid_path = os.path.join(output_folder, 'CT_centroid.csv')
+    centroid_path = os.path.join(output_folder, centroid_filename)
     _generate_centroid_csv(contours, contour_list, centroid_path)
 
     log(70, "Calculating distances...")
-    distance_path = os.path.join(output_folder, 'CT_distances.csv')
+    distance_path = os.path.join(output_folder, distance_filename)
     _generate_distance_csv_parallel(contours, contour_list, dx, dy, dz, distance_path, num_cores, log)
 
     log(100, "CSV generation complete!")
